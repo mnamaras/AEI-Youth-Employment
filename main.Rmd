@@ -1,0 +1,765 @@
+---
+title: "main"
+output: html_document
+date: "2026-11-09"
+---
+
+# Setup
+
+```{r setup}
+library(ipumsr)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(ggplot2)
+
+# Hide package messages and warnings in the knitted report
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+
+# Age groups used throughout (change them here only)
+young_min = 22
+young_max = 25
+older_min = 30
+older_max = 55
+
+young_label = paste0(young_min, "-", young_max)
+older_label = paste0(older_min, "-", older_max)
+group_colors = setNames(c("skyblue", "navy"), c(young_label, older_label))
+```
+
+```{r load-data}
+# IPUMS CPS (read once, used for both age groups)
+ddi = read_ipums_ddi("cps_00003.xml")
+cps_raw = read_ipums_micro(ddi)
+
+# O*NET exposure scores
+onet_exposures = read.csv("occ_level.csv")
+
+# Crosswalks
+crosswalk1 = read_excel("2002_2011_occupation_crosswalk.xls",
+                        sheet = "2010summ", skip = 2, col_types = "text")
+
+crosswalk2 = read_excel("soc_2010_to_2018_crosswalk.xlsx",
+                        sheet = "Sorted by 2010", skip = 8, col_types = "text")
+```
+
+# Exposure lookup (built once, used for every group)
+
+```{r exposure-lookup}
+# BLS 2010 SOC <-> 2018 SOC
+bls = crosswalk2
+bls = transmute(bls,
+                soc2010 = str_trim(`2010 SOC Code`),
+                soc2018 = str_trim(`2018 SOC Code`))
+bls = filter(bls, str_detect(soc2010, "^\\d\\d-\\d{4}$"))
+bls = filter(bls, str_detect(soc2018, "^\\d\\d-\\d{4}$"))
+bls = distinct(bls)
+
+# Each O*NET occupation gets its 2010 SOC code(s)
+onet = onet_exposures
+onet = mutate(onet, soc2018 = str_sub(O.NET.SOC.Code, 1, 7))
+onet = left_join(onet, bls, by = "soc2018", relationship = "many-to-many")
+
+# Census 2010 occupation codes, with SOC prefixes for broad groups and wildcards
+xw = crosswalk1
+xw = transmute(xw,
+               soc    = str_trim(`2010 SOC Code`),
+               census = str_trim(`2010 Census Code`))
+xw = filter(xw, str_detect(census, "^\\d{4}$"))
+xw = filter(xw, soc != "none")
+has_X = str_detect(xw$soc, "X")
+xw$prefix = if_else(has_X,
+                    str_remove(xw$soc, "X+$"),    # 15-113X -> 15-113
+                    str_remove(xw$soc, "0+$"))    # 13-1030 -> 13-103
+
+# 2010 SOC -> Census code (longest matching prefix wins)
+find_census = function(s) {
+  if (is.na(s)) return(NA_character_)
+  hits = xw[startsWith(s, xw$prefix), ]
+  if (nrow(hits) == 0) return(NA_character_)
+  hits$census[which.max(nchar(hits$prefix))]
+}
+onet$census = vapply(onet$soc2010, find_census, character(1))
+
+# One exposure value per Census code
+census_exposure = filter(onet, !is.na(census))
+census_exposure = group_by(census_exposure, census)
+census_exposure = summarise(census_exposure,
+                            dv_rating_beta = mean(dv_rating_beta, na.rm = TRUE),
+                            .groups = "drop")
+```
+
+# Prepare the two age groups
+
+```{r prepare-groups}
+# Employed college graduates (bachelor's or higher) in an age range, with exposure attached
+prepare_group = function(raw, age_min, age_max) {
+  # Age range and bachelor's degree or higher
+  out = raw[raw$AGE >= age_min & raw$AGE <= age_max & raw$EDUC >= 111, ]
+
+  # Employed
+  out = out[out$EMPSTAT == 1 | out$EMPSTAT == 10 | out$EMPSTAT == 12, ]
+
+  # Valid occupation codes
+  out = out[out$OCC != 0, ]
+  out = out[out$OCC2010 != 9999, ]
+
+  # Drop columns we don't use
+  out$EDCYC = NULL
+  out$EDDIPGED = NULL
+  out$EDHGCGED = NULL
+
+  # Average-month weight (12 pooled months)
+  out$monthly_weight = out$WTFINL / 12
+
+  # Exposure and occupation title
+  codes = sprintf("%04d", as.integer(out$OCC2010))
+  out$dv_rating_beta = census_exposure$dv_rating_beta[match(codes, census_exposure$census)]
+  out$occ_title = as.character(as_factor(out$OCC2010))
+
+  out
+}
+
+people_data      = prepare_group(cps_raw, young_min, young_max)
+people_data_3055 = prepare_group(cps_raw, older_min, older_max)
+```
+
+--------------------------------------------------------------------------------------
+
+# Question 1: What do 22-25 year old college graduates in the US do, and how exposed are their occupations?
+
+```{r q1-table}
+occ_table = group_by(people_data, OCC2010, occ_title)
+
+occ_table = summarise(occ_table,
+                      n_people        = n(),                    # raw respondent count
+                      weighted_people = sum(monthly_weight),    # estimated people
+                      exposure        = first(dv_rating_beta),  # same for everyone in the occupation
+                      .groups = "drop")
+
+# Weighted share of all young graduates
+occ_table$share     = occ_table$weighted_people / sum(occ_table$weighted_people)
+occ_table$share_pct = round(100 * occ_table$share, 1)
+
+# Sort and keep the top 30
+occ_table = arrange(occ_table, desc(weighted_people))
+top30 = head(occ_table, 30)
+top30$weighted_people = round(top30$weighted_people)
+```
+
+```{r q1-top30-chart, fig.width=12, fig.height=8}
+p = ggplot(top30, aes(x = exposure, y = reorder(occ_title, exposure))) +
+  geom_col(fill = "skyblue") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "Task exposure of the 30 largest occupations",
+       x = "Exposure (dv_rating_beta)",
+       y = NULL) +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 7),
+        plot.title.position = "plot")
+
+ggsave("top30_exposure.png", plot = p, width = 16, height = 9, dpi = 200)
+p
+```
+
+## Same table for the older group
+
+```{r older-group-table}
+occ_table_3055 = group_by(people_data_3055, OCC2010, occ_title)
+
+occ_table_3055 = summarise(occ_table_3055,
+                           n_people        = n(),                    # raw respondent count
+                           weighted_people = sum(monthly_weight),    # estimated people
+                           exposure        = first(dv_rating_beta),  # same for everyone in the occupation
+                           .groups = "drop")
+
+# Weighted share of all graduates in this age group
+occ_table_3055$share     = occ_table_3055$weighted_people / sum(occ_table_3055$weighted_people)
+occ_table_3055$share_pct = round(100 * occ_table_3055$share, 1)
+
+# Sort, then keep the same occupations as the young group's top 30
+occ_table_3055 = arrange(occ_table_3055, desc(weighted_people))
+top30_3055 = filter(occ_table_3055, OCC2010 %in% top30$OCC2010)
+top30_3055$weighted_people = round(top30_3055$weighted_people)
+```
+
+## Comparing the age groups
+
+```{r exposure-histogram-by-age}
+young = data.frame(dv_rating_beta = people_data$dv_rating_beta,
+                   w              = people_data$monthly_weight,
+                   group          = young_label)
+
+older = data.frame(dv_rating_beta = people_data_3055$dv_rating_beta,
+                   w              = people_data_3055$monthly_weight,
+                   group          = older_label)
+
+both = rbind(young, older)
+both = filter(both, !is.na(dv_rating_beta))
+
+# Each person's weight as a share of their own group's total
+both$w_share = both$w / ave(both$w, both$group, FUN = sum)
+
+p_both = ggplot(both, aes(x = dv_rating_beta, weight = w_share, fill = group)) +
+  geom_histogram(binwidth = 0.05, boundary = 0, position = "dodge", color = "white") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = group_colors) +
+  labs(title = "Exposure of occupations held by employed graduates, by age group",
+       x = "Exposure (dv_rating_beta)",
+       y = "Share of age group",
+       fill = "Age group") +
+  theme_classic()
+
+ggsave("exposure_hist_by_age.png", plot = p_both, width = 12, height = 6, dpi = 200)
+p_both
+```
+
+```{r share-by-age-chart, fig.width=14, fig.height=13}
+# One row per top-30 occupation, with both age groups' shares
+share_compare = data.frame(OCC2010    = top30$OCC2010,
+                           occ_title  = str_wrap(top30$occ_title, 60),
+                           share_2225 = top30$share_pct)
+share_compare$share_3055 = occ_table_3055$share_pct[match(share_compare$OCC2010, occ_table_3055$OCC2010)]
+
+# Long format: one row per occupation per age group
+long = data.frame(occ_title = rep(share_compare$occ_title, 2),
+                  group     = rep(c(young_label, older_label), each = nrow(share_compare)),
+                  share     = c(share_compare$share_2225, share_compare$share_3055))
+
+# Keep the young group's ordering (largest occupation at the top)
+long$occ_title = factor(long$occ_title, levels = rev(share_compare$occ_title))
+
+p_compare = ggplot(long, aes(x = share, y = occ_title, fill = group)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = group_colors) +
+  labs(title = paste0("Where graduates work: the 30 largest occupations for ages ", young_label),
+       x = "Share of age group working in occupation (%)",
+       y = NULL,
+       fill = "Age group") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 8),
+        plot.title.position = "plot")
+
+ggsave("top30_share_by_age.png", plot = p_compare, width = 16, height = 12, dpi = 200)
+p_compare
+```
+
+```{r mean-exposure-by-age}
+mean_2225 = weighted.mean(people_data$dv_rating_beta,
+                          people_data$monthly_weight, na.rm = TRUE)
+
+mean_3055 = weighted.mean(people_data_3055$dv_rating_beta,
+                          people_data_3055$monthly_weight, na.rm = TRUE)
+
+mean_2225
+mean_3055
+mean_2225 - mean_3055
+```
+
+```{r exposure-vs-size-scatter}
+p_scatter = ggplot(filter(occ_table, !is.na(exposure)), aes(x = exposure, y = 100 * share, size = n_people)) +
+  geom_point(alpha = 0.5, color = "navy") +
+  geom_text(data = top30[1:10, ],
+            aes(label = str_trunc(occ_title, 30)),
+            size = 3, vjust = -1, check_overlap = TRUE, show.legend = FALSE) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1)) +
+  labs(title = paste0("Exposure vs. size of occupation, ages ", young_label),
+       x = "Exposure (dv_rating_beta)",
+       y = paste0("Share of ", young_label, " graduates (%)"),
+       size = "Respondents") +
+  theme_classic()
+p_scatter
+```
+
+Conclusions:
+
+- Average level of exposure for 22-25: 0.4319888.
+- Most people are honestly not too crazy exposed, mostly around 0 to 0.5, and even then the % is so low that like...
+- The limitation of this, and of comparing it to 30-55, is that it doesn't differentiate between entry level, etc.
+- That would have to do with the tasks, and that's where AEI comes in, but then how do you classify a task as being entry level or not?
+
+--------------------------------------------------------------------------------------
+
+# Question 2: Of that exposure, how much is observed automation-style vs. augmentation-style Claude usage?
+
+```{r aei-read}
+aei_data = read.csv("aei_claude_ai_2026-06-26.csv")
+```
+
+```{r aei-occupation-table}
+# Global automation and augmentation data for each occupation (April 2026)
+aei_occ = aei_data %>%
+  filter(geo_id == "GLOBAL",
+         category_name == "soc_occupation",
+         hierarchy_level == 0,
+         date_start == "2026-04-01",
+         metric_id %in% c("pct",
+                          "collaboration_bucket_automation_pct",
+                          "collaboration_bucket_augmentation_pct",
+                          "human_only_time_mean",
+                          "human_with_ai_time_mean")) %>%
+  select(node_name, node_external_id, metric_id, value) %>%
+  pivot_wider(names_from = metric_id, values_from = value) %>%
+  rename(usage_pct        = pct,
+         automation_pct   = collaboration_bucket_automation_pct,
+         augmentation_pct = collaboration_bucket_augmentation_pct,
+         human_only_hours = human_only_time_mean,
+         with_ai_minutes  = human_with_ai_time_mean)
+
+aei_occ$automation_share = aei_occ$automation_pct / 100
+```
+
+```{r aei-to-census}
+# Add the AEI values to the O*NET table, then average within each Census code
+onet_aei = onet %>%
+  left_join(aei_occ, by = c("O.NET.SOC.Code" = "node_external_id"))
+
+onet_aei$node_name = NULL
+
+census_aei = onet_aei %>%
+  filter(!is.na(census), !is.na(automation_share)) %>%
+  distinct(O.NET.SOC.Code, census, .keep_all = TRUE) %>%
+  group_by(census) %>%
+  summarise(automation_share = mean(automation_share),
+            time_saved_share = mean(1 - with_ai_minutes / (human_only_hours * 60), na.rm = TRUE),
+            .groups = "drop")
+```
+
+```{r aei-attach-and-split}
+# Attach to the young graduates
+people_codes = sprintf("%04d", as.integer(people_data$OCC2010))
+people_data$automation_share = census_aei$automation_share[match(people_codes, census_aei$census)]
+people_data$time_saved_share = census_aei$time_saved_share[match(people_codes, census_aei$census)]
+
+# Split each person's exposure into automation-style and augmentation-style parts
+people_data$exposure_auto = people_data$dv_rating_beta * people_data$automation_share
+people_data$exposure_aug  = people_data$dv_rating_beta * (1 - people_data$automation_share)
+
+# Only people with both an exposure and an AEI value
+has_aei = !is.na(people_data$dv_rating_beta) & !is.na(people_data$automation_share)
+w = people_data$monthly_weight[has_aei]
+
+coverage      = weighted.mean(has_aei, people_data$monthly_weight)   # share of all graduates covered
+mean_exposure = weighted.mean(people_data$dv_rating_beta[has_aei], w)
+mean_auto     = weighted.mean(people_data$exposure_auto[has_aei], w)
+mean_aug      = weighted.mean(people_data$exposure_aug[has_aei], w)
+
+coverage
+mean_exposure
+mean_auto
+mean_aug
+mean_auto + mean_aug       # should equal mean_exposure
+mean_auto / mean_exposure  # share of exposure that is automation-style
+```
+
+```{r final-table}
+final_table = people_data %>%
+  group_by(OCC2010, occ_title) %>%
+  summarise(n_people         = n(),
+            weighted_people  = sum(monthly_weight),
+            exposure         = first(dv_rating_beta),
+            automation_share = first(automation_share),
+            exposure_auto    = first(exposure_auto),
+            exposure_aug     = first(exposure_aug),
+            .groups = "drop") %>%
+  arrange(desc(weighted_people))
+
+final_table$share_pct = round(100 * final_table$weighted_people / sum(final_table$weighted_people), 1)
+
+top30_final = head(final_table, 30)
+top30_final
+```
+
+## Robustness check: task-weighted automation share
+
+```{r task-ratings}
+task_ratings = read_xlsx("Task Ratings.xlsx", sheet = "Task Ratings")
+
+# Importance rating of each task within each occupation
+task_imp = task_ratings %>%
+  filter(`Scale ID` == "IM") %>%
+  transmute(onet_code  = `O*NET-SOC Code`,
+            task_id    = as.character(`Task ID`),
+            importance = as.numeric(`Data Value`))
+
+# AEI automation share for each task
+aei_task = aei_data %>%
+  filter(geo_id == "GLOBAL",
+         category_name == "onet",
+         hierarchy_level == 0,
+         date_start == "2026-04-01",
+         metric_id == "collaboration_bucket_automation_pct") %>%
+  transmute(task_id          = as.character(node_external_id),
+            automation_share = value / 100)
+
+# Importance and automation share together (only ~9.7% of tasks have AEI data)
+task_imp = left_join(task_imp, aei_task, by = "task_id")
+```
+
+```{r task-weighted-loop}
+occ_codes = unique(task_imp$onet_code)
+
+results = data.frame(onet_code             = occ_codes,
+                     automation_share_task = NA_real_,
+                     n_tasks               = NA_integer_,
+                     n_tasks_aei           = NA_integer_,
+                     importance_covered    = NA_real_)
+
+for (i in seq_along(occ_codes)) {
+  this_occ = task_imp[task_imp$onet_code == occ_codes[i], ]
+  has_data = !is.na(this_occ$automation_share)
+
+  results$n_tasks[i]            = nrow(this_occ)
+  results$n_tasks_aei[i]        = sum(has_data)
+  results$importance_covered[i] = sum(this_occ$importance[has_data]) / sum(this_occ$importance)
+
+  if (sum(has_data) > 0) {
+    results$automation_share_task[i] = weighted.mean(this_occ$automation_share[has_data],
+                                                     this_occ$importance[has_data])
+  }
+}
+
+# Add the occupation titles
+results = results %>%
+  left_join(select(onet_exposures, O.NET.SOC.Code, Title),
+            by = c("onet_code" = "O.NET.SOC.Code")) %>%
+  relocate(Title, .after = onet_code)
+
+sum(is.na(results$Title))    # occupations with no title
+```
+
+```{r task-vs-simple}
+# Compare with the simple (usage-weighted) automation share
+task_compare = results %>%
+  left_join(aei_occ %>% transmute(onet_code               = node_external_id,
+                                  automation_share_simple = automation_share),
+            by = "onet_code")
+
+# All occupations
+cor(task_compare$automation_share_task, task_compare$automation_share_simple, use = "complete.obs")
+mean(abs(task_compare$automation_share_task - task_compare$automation_share_simple), na.rm = TRUE)
+sum(complete.cases(task_compare$automation_share_task, task_compare$automation_share_simple))  # occupations compared
+sd(task_compare$automation_share_simple, na.rm = TRUE)                                         # spread, for scale
+mean(task_compare$automation_share_task - task_compare$automation_share_simple, na.rm = TRUE)  # signed gap
+
+# Well-covered occupations only
+ok = task_compare$n_tasks_aei >= 3 & task_compare$importance_covered >= 0.2
+
+sum(ok, na.rm = TRUE)    # how many occupations
+cor(task_compare$automation_share_task[ok], task_compare$automation_share_simple[ok], use = "complete.obs")
+mean(abs(task_compare$automation_share_task[ok] - task_compare$automation_share_simple[ok]), na.rm = TRUE)
+sd(task_compare$automation_share_simple[ok], na.rm = TRUE)
+```
+
+--------------------------------------------------------------------------------------
+
+# Question 3: How are young people choosing jobs? Look at the % of young people in these top 30 before and after LLM emergence
+
+```{r historic-data}
+ddi_historic = read_ipums_ddi("cps_00004.xml")
+data_historic = read_ipums_micro(ddi_historic)
+
+data_historic = data_historic %>%
+  filter(AGE >= young_min & AGE <= young_max,
+         EDUC >= 111,
+         EMPSTAT == 1 | EMPSTAT == 10 | EMPSTAT == 12,
+         OCC != 0,
+         OCC2010 != 9999) %>%
+  mutate(EDCYC    = NULL,
+         EDDIPGED = NULL,
+         EDHGCGED = NULL)
+
+# Exposure
+codes_historic = sprintf("%04d", as.integer(data_historic$OCC2010))
+data_historic$dv_rating_beta = census_exposure$dv_rating_beta[match(codes_historic, census_exposure$census)]
+
+# Before / after ChatGPT; weights averaged over the years in each period
+data_historic = data_historic %>%
+  mutate(period = if_else(YEAR <= 2022, "before", "after")) %>%
+  group_by(period) %>%
+  mutate(weight = ASECWT / n_distinct(YEAR)) %>%
+  ungroup()
+```
+
+```{r historic-shares-by-year}
+data_historic$occ_title = as.character(as_factor(data_historic$OCC2010))
+
+# Share of all young graduates in each occupation, within each year
+occ_by_year = data_historic %>%
+  group_by(YEAR, OCC2010, occ_title) %>%
+  summarise(n_people        = n(),
+            weighted_people = sum(ASECWT),
+            exposure        = first(dv_rating_beta),
+            .groups = "drop") %>%
+  group_by(YEAR) %>%
+  mutate(share_pct = 100 * weighted_people / sum(weighted_people)) %>%
+  ungroup()
+
+# Keep the top 30 occupations from the Question 1 table
+occ_top30_by_year = filter(occ_by_year, OCC2010 %in% top30$OCC2010)
+```
+
+```{r historic-charts-loop, fig.width=7, fig.height=4}
+dir.create("occ_charts", showWarnings = FALSE)
+
+occ_list = as.numeric(top30$OCC2010)
+occ_top30_by_year$OCC2010 = as.numeric(occ_top30_by_year$OCC2010)
+
+for (i in seq_along(occ_list)) {
+  this_code  = occ_list[i]
+  this_data  = occ_top30_by_year[occ_top30_by_year$OCC2010 == this_code, ]
+  this_title = this_data$occ_title[1]
+
+  p_i = ggplot(this_data, aes(x = YEAR, y = share_pct)) +
+    geom_line(color = "navy") +
+    geom_point(size = 2) +
+    geom_vline(xintercept = 2022.5, linetype = "dashed") +
+    labs(title    = this_title,
+         subtitle = paste0("Exposure: ", round(this_data$exposure[1], 2)),
+         x = NULL,
+         y = "Share of graduates (%)") +
+    theme_classic()
+
+  print(p_i)
+  ggsave(paste0("occ_charts/", i, "_", this_code, ".png"),
+         plot = p_i, width = 7, height = 4, dpi = 150)
+}
+```
+
+--------------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------------
+
+# Question 4: Have outcomes diverged for high-exposure occupations since late 2022? (DiD)
+
+Design: compare the share of young graduates working in high- vs low-exposure occupations before and after 2022 (difference-in-differences), then check the timing with an event study. Needs `occ_table` (Q1), `data_historic` and `top30` already in memory.
+
+## Step 1: exposure groups
+
+```{r q4-groups}
+# All occupations with an exposure score, most exposed first
+occ_exposure = occ_table %>%
+  filter(!is.na(exposure)) %>%
+  arrange(desc(exposure))
+
+# Top and bottom third (by number of occupations)
+third = round(nrow(occ_exposure) / 3, 0)
+
+occ_top_exposed = head(occ_exposure, third)
+occ_low_exposed = tail(occ_exposure, third)
+
+occ_groups = rbind(data.frame(OCC2010 = as.numeric(occ_top_exposed$OCC2010), group = "high"),
+                   data.frame(OCC2010 = as.numeric(occ_low_exposed$OCC2010), group = "low"))
+```
+
+## Step 2: occupation x year panel
+
+```{r q4-panel}
+ids = as.numeric(occ_exposure$OCC2010)
+data_historic$OCC2010 = as.numeric(data_historic$OCC2010)
+
+# Total weighted young graduates in each year (the denominator for shares)
+year_totals = data_historic %>%
+  group_by(YEAR) %>%
+  summarise(total_weight = sum(ASECWT), .groups = "drop")
+
+# Weighted headcount for each occupation-year
+panel = data_historic %>%
+  filter(OCC2010 %in% ids) %>%
+  group_by(YEAR, OCC2010) %>%
+  summarise(n_people        = n(),
+            weighted_people = sum(ASECWT),
+            .groups = "drop")
+
+# Fill occupation-years that never appear with 0
+panel = panel %>%
+  complete(YEAR, OCC2010 = ids,
+           fill = list(n_people = 0, weighted_people = 0))
+
+# Shares of all young graduates in that year
+panel = panel %>%
+  left_join(year_totals, by = "YEAR")
+panel$share_pct = 100 * panel$weighted_people / panel$total_weight
+
+# Exposure, group, and before/after indicator
+panel$exposure = occ_exposure$exposure[match(panel$OCC2010, ids)]
+panel$group    = occ_groups$group[match(panel$OCC2010, occ_groups$OCC2010)]
+panel$group[is.na(panel$group)] = "middle"
+panel$post     = as.numeric(panel$YEAR > 2022)
+
+# Occupation size before ChatGPT (used as regression weights)
+pre_size = panel %>%
+  filter(YEAR <= 2022) %>%
+  group_by(OCC2010) %>%
+  summarise(pre_size = mean(weighted_people), .groups = "drop")
+
+panel = left_join(panel, pre_size, by = "OCC2010")
+
+panel$high       = as.numeric(panel$group == "high")
+panel$log_people = log(panel$weighted_people + 1)
+panel$exposure10 = panel$exposure * 10   # coefficient = effect per 0.1 of exposure
+
+# High vs low only (the middle third is dropped)
+did_data = filter(panel, group %in% c("high", "low"))
+
+# Checks
+nrow(panel) == length(ids) * n_distinct(panel$YEAR)   # TRUE = balanced panel
+"pre_size" %in% names(did_data)                       # TRUE
+```
+
+## Step 3: high vs low over time
+
+```{r q4-plots}
+group_year = panel %>%
+  filter(group %in% c("high", "low")) %>%
+  group_by(YEAR, group) %>%
+  summarise(share_pct       = sum(share_pct),
+            weighted_people = sum(weighted_people),
+            .groups = "drop")
+
+# Index to 2022 = 100 (within each group)
+base_2022 = group_year %>%
+  filter(YEAR == 2022) %>%
+  select(group, base_share = share_pct, base_people = weighted_people)
+
+group_year = left_join(group_year, base_2022, by = "group")
+
+group_year$share_index  = 100 * group_year$share_pct / group_year$base_share
+group_year$people_index = 100 * group_year$weighted_people / group_year$base_people
+
+group_colors2 = c(high = "navy", low = "skyblue")
+
+# Chart 1: raw share of young graduates
+p_share = ggplot(group_year, aes(x = YEAR, y = share_pct, color = group)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2022.5, linetype = "dashed") +
+  scale_color_manual(values = group_colors2) +
+  scale_x_continuous(breaks = sort(unique(group_year$YEAR))) +
+  labs(title = "Share of young graduates in high- vs low-exposure occupations",
+       x = NULL,
+       y = "Share of 22-25 graduates (%)",
+       color = "Exposure group") +
+  theme_classic()
+
+# Chart 2: indexed to 2022 = 100
+p_index = ggplot(group_year, aes(x = YEAR, y = share_index, color = group)) +
+  geom_hline(yintercept = 100, color = "grey70") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2022.5, linetype = "dashed") +
+  scale_color_manual(values = group_colors2) +
+  scale_x_continuous(breaks = sort(unique(group_year$YEAR))) +
+  labs(title = "Same series, indexed (2022 = 100)",
+       x = NULL,
+       y = "Index (2022 = 100)",
+       color = "Exposure group") +
+  theme_classic()
+
+ggsave("high_vs_low_share.png", plot = p_share, width = 9, height = 5, dpi = 200)
+ggsave("high_vs_low_index.png", plot = p_index, width = 9, height = 5, dpi = 200)
+
+p_share
+p_index
+```
+
+## Step 4: difference-in-differences
+
+```{r q4-did}
+library(sandwich)
+library(lmtest)
+
+# 1. Share (percentage points)
+m1 = lm(share_pct ~ high:post + factor(OCC2010) + factor(YEAR),
+        data = did_data, weights = pre_size)
+
+# 2. Log headcount
+m2 = lm(log_people ~ high:post + factor(OCC2010) + factor(YEAR),
+        data = did_data, weights = pre_size)
+
+# 3. Continuous exposure, all occupations
+m3 = lm(share_pct ~ exposure10:post + factor(OCC2010) + factor(YEAR),
+        data = panel, weights = pre_size)
+
+# 4. Drop the COVID years
+did_nocovid = filter(did_data, !YEAR %in% c(2020, 2021))
+m4 = lm(share_pct ~ high:post + factor(OCC2010) + factor(YEAR),
+        data = did_nocovid, weights = pre_size)
+
+# 5. Log headcount again, only occupations with people in every year
+always_present = panel %>%
+  group_by(OCC2010) %>%
+  summarise(min_people = min(weighted_people), .groups = "drop") %>%
+  filter(min_people > 0)
+
+did_present = filter(did_data, OCC2010 %in% always_present$OCC2010)
+m5 = lm(log_people ~ high:post + factor(OCC2010) + factor(YEAR),
+        data = did_present, weights = pre_size)
+
+# Standard errors clustered by occupation, DiD term only
+coeftest(m1, vcov = vcovCL, cluster = did_data$OCC2010)["high:post", ]
+coeftest(m2, vcov = vcovCL, cluster = did_data$OCC2010)["high:post", ]
+coeftest(m3, vcov = vcovCL, cluster = panel$OCC2010)["exposure10:post", ]
+coeftest(m4, vcov = vcovCL, cluster = did_nocovid$OCC2010)["high:post", ]
+coeftest(m5, vcov = vcovCL, cluster = did_present$OCC2010)["high:post", ]
+```
+
+## Step 5: event study (2022 = base year)
+
+```{r q4-event-study}
+years = setdiff(sort(unique(did_data$YEAR)), 2022)
+
+for (y in years) {
+  did_data[[paste0("high_", y)]] = did_data$high * (did_data$YEAR == y)
+}
+
+f = as.formula(paste("share_pct ~",
+                     paste0("high_", years, collapse = " + "),
+                     "+ factor(OCC2010) + factor(YEAR)"))
+
+m_event = lm(f, data = did_data, weights = pre_size)
+
+ct = coeftest(m_event, vcov = vcovCL, cluster = did_data$OCC2010)
+
+event_coefs = data.frame(YEAR = as.numeric(sub("high_", "", rownames(ct)[grepl("^high_", rownames(ct))])),
+                         est  = ct[grepl("^high_", rownames(ct)), "Estimate"],
+                         se   = ct[grepl("^high_", rownames(ct)), "Std. Error"],
+                         p    = ct[grepl("^high_", rownames(ct)), "Pr(>|t|)"])
+event_coefs
+
+# Add the base year (0 by construction) and plot with 95% intervals
+event_plot = rbind(event_coefs, data.frame(YEAR = 2022, est = 0, se = 0, p = NA))
+event_plot$lo = event_plot$est - 1.96 * event_plot$se
+event_plot$hi = event_plot$est + 1.96 * event_plot$se
+
+p_event = ggplot(event_plot, aes(x = YEAR, y = est)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_vline(xintercept = 2022.5, linetype = "dashed") +
+  geom_pointrange(aes(ymin = lo, ymax = hi), color = "navy") +
+  scale_x_continuous(breaks = sort(unique(event_plot$YEAR))) +
+  labs(title = "Event study: high- vs low-exposure occupations",
+       x = NULL,
+       y = "Difference in share (pp), relative to 2022") +
+  theme_classic()
+
+ggsave("event_study.png", plot = p_event, width = 9, height = 5, dpi = 200)
+p_event
+```
+
+--------------------------------------------------------------------------------------
+
+# Summary and limitations
+
+- Employed 22-25 year old graduates work in occupations with an average exposure of 0.43, similar to 30-55 year old graduates (0.45).
+- About half of that exposure is automation-style Claude usage and half is augmentation-style.
+- Since late 2022 (release of ChatGPT), there is no clear shift in the share of young graduates working in high vs low-exposure occupations.
+
+**Limitations**
+
+- AEI covers only about 10% of O*NET tasks and measures Claude usage, not the share of a job made of AI tasks.
+- Exposure and AEI describe occupations, not seniority within an occupation, so entry-level tasks cannot be separated from senior ones.
+- The sample is employed graduates only, so changes in hiring or unemployment do not show up in occupation shares. It would be worth exploring hiring and unemployment data as well to see if there are changes in the share of occupations for new hires and unemployment.
+- Only 22-25 and 30-55 year old graduates are compared; non-graduates are not included, and older recent university graduates not included.
+- Yearly CPS ASEC samples are small, so confidence intervals are wide and moderate effects cannot be ruled out.
