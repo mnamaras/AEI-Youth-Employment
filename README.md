@@ -56,3 +56,4 @@ Create a free IPUMS account and build an extract with:
 - Eloundou et al., "GPTs are GPTs."
 - Anthropic Economic Index.
 - O*NET database.
+- Claude (Sonnet 5.5) was used to clean up, organize, and debug R code
