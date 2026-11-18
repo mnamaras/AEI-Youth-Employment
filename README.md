@@ -42,7 +42,7 @@ See `main.pdf` for the full output.
 
 ### IPUMS extract
 Create a free IPUMS account and build an extract with:
-- Samples: [fill in from cps_00003.xml and cps_00004.xml]
+- Samples: See cps_00003.xml and cps_00004.xml
 - Variables: YEAR, AGE, EDUC, EMPSTAT, OCC, OCC2010, WTFINL, ASECWT
 - `cps_00003.xml` (monthly, ages 22-25 and 30-55) and `cps_00004.xml` (yearly March ASEC, 2016-2026) describe the extracts used.
 
