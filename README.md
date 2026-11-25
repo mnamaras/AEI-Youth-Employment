@@ -17,7 +17,7 @@ A written report is in progress.
 - No statistically detectable shift in young graduates' share of employment in
   high- vs. low-exposure occupations after 2022 (difference-in-differences and event study).
 
-See `main.pdf` for the full output.
+See `main.pdf` for the full output and 'Rough report.pdf' for a written analysis.
 
 ## Limitations
 - Exposure and AEI describe occupations, not seniority within them.
